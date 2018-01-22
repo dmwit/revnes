@@ -1,0 +1,46 @@
+name:                revnes
+version:             0.0.0
+-- synopsis:            
+-- description:         
+license:             BSD3
+license-file:        LICENSE
+author:              Daniel Wagner
+maintainer:          me@dmwit.com
+-- copyright:           
+category:            Development
+build-type:          Simple
+extra-source-files:  ChangeLog.md
+cabal-version:       >=1.10
+
+library
+  exposed-modules:     RevNES.MemMap,
+                       RevNES.MemMap.INES,
+                       RevNES.Parse,
+                       RevNES.PrettyPrint.Pseudo,
+                       RevNES.Types
+  -- other-modules:       
+  -- other-extensions:    
+  build-depends:       array >=0.5 && <0.6,
+                       attoparsec >=0.13 && <0.14,
+                       base >=4.10 && <4.11,
+                       bytestring >=0.10 && <0.11,
+                       containers >=0.5 && <0.6,
+                       cryptonite >=0.24 && <0.25,
+                       filepath >=1.4 && <1.5,
+                       mtl >=2.2 && <2.3,
+                       zip-archive >=0.3 && <0.4
+  -- hs-source-dirs:      
+  default-language:    Haskell2010
+  ghc-options:         -fno-warn-tabs
+
+executable revnes
+  main-is:             revnes.hs
+  other-modules:       RevNES.UI
+  build-depends:       base >=4.10 && <4.11,
+                       brick >=0.32 && <0.33,
+                       revnes,
+                       text-zipper >=0.10 && <0.11,
+                       vector >=0.12 && <0.13,
+                       vty >=5.19 && <5.20
+  default-language:    Haskell2010
+  ghc-options:         -threaded -fno-warn-tabs
