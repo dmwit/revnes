@@ -233,7 +233,7 @@ parseHeader = do
 	prgRams <- max 1 <$> anyWord8
 	tvSystem <- satisfy (<2)
 	f10 <- anyWord8
-	string (BS.pack [0, 0, 0, 0, 0])
+	string (BS.replicate 5 0)
 	return PreParseHeader
 		{ pp_prgROMSize = prgRoms
 		, pp_chrROMSize = chrRoms
@@ -271,6 +271,9 @@ parseINES = do
 	trn <- if pp_hasTrainer pph then Just <$> P.take 0x200 else return Nothing
 	prgROMs <- replicateM (fromIntegral (pp_prgROMSize pph)) (P.take 0x4000)
 	chrROMs <- replicateM (fromIntegral (pp_chrROMSize pph)) (P.take 0x2000)
+	-- TODO: This does not gracefully handle the situation where there is a
+	-- PlayChoice ROM only (no keys) and a name, because parsePlayChoice will
+	-- take the first 0x20 bytes of the name and treat it as PlayChoice keys.
 	pc <- if pp_playChoice10 pph then Just <$> parsePlayChoice else return Nothing
 	n <- asum [P.take 128, P.take 127, return BS.empty]
 	endOfInput
