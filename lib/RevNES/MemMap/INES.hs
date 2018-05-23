@@ -22,12 +22,12 @@ import qualified Data.ByteString.Char8 as BS8
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Map as M
 
-autodetectLoad :: FilePath -> ExceptT String IO (Mapper, Context, MemMap)
+autodetectLoad :: FilePath -> ExceptT String IO (Mapper, Chunks, MemMap)
 autodetectLoad fp = case takeExtension fp of
 	".zip" -> loadZip fp
 	_ -> tryReadFile fp >>= loadByteString (File fp)
 
-loadZip :: FilePath -> ExceptT String IO (Mapper, Context, MemMap)
+loadZip :: FilePath -> ExceptT String IO (Mapper, Chunks, MemMap)
 loadZip fp = do
 	bs <- tryReadFile fp
 	archive <- either throwError return $ toArchiveOrFail bs
@@ -37,7 +37,7 @@ loadZip fp = do
 		entries -> throwError (fp ++ " contains multiple files named *.nes: " ++ show entries)
 	loadByteString (Zip fp . File (eRelativePath entry)) (fromEntry entry)
 
-loadByteString :: (Slice -> Source) -> LBS.ByteString -> ExceptT String IO (Mapper, Context, MemMap)
+loadByteString :: (Slice -> Source) -> LBS.ByteString -> ExceptT String IO (Mapper, Chunks, MemMap)
 loadByteString src bs = case parse parseINES bs of
 	Done rest ines
 		| rest == LBS.empty -> inesToMemMap src ines
@@ -50,9 +50,9 @@ loadByteString src bs = case parse parseINES bs of
 		++ intercalate "," ctxts ++ "\n\t"
 		++ err
 
-inesToMemMap :: (Slice -> Source) -> INES -> ExceptT String IO (Mapper, Context, MemMap)
+inesToMemMap :: (Slice -> Source) -> INES -> ExceptT String IO (Mapper, Chunks, MemMap)
 inesToMemMap src ines = do
-	context <- mContext
+	chunks <- mChunks
 	(prgA, prgB) <- case prgs ines of
 		[] -> throwError $ "There are no PRG ROMs in " ++ inesName ++ " to put in the memory map."
 		[prg] | BS.length prg == 0x4000 -> return (prg, prg)
@@ -60,12 +60,12 @@ inesToMemMap src ines = do
 			|  BS.length prgA <= 0x4000
 			&& BS.length prgB == 0x4000 -> return (prgA, prgB)
 		_ -> throwError $ "The impossible happened! The PRG ROMs in " ++ inesName ++ " are not exactly 16KiB long."
-	return (mapper (header ines), context, buildMemMap prgA prgB)
+	return (mapper (header ines), chunks, buildMemMap prgA prgB)
 	where
-	mContext = id
-		. traverse validateContextItems
+	mChunks = id
+		. traverse validateChunk
 		. M.fromListWith (++)
-		. map (\((bs, name), offset) -> (hash bs, [ContextItem
+		. map (\((bs, name), offset) -> (hash bs, [Chunk
 		  	{ source = src (Slice offset (fromIntegral (BS.length bs)))
 		  	, content = bs
 		  	, description = name
@@ -74,9 +74,9 @@ inesToMemMap src ines = do
 		. scanl (\offset (bs, _) -> offset + fromIntegral (BS.length bs)) headerLen
 		$ chunks
 
-	validateContextItems :: [ContextItem] -> ExceptT String IO ContextItem
-	validateContextItems [] = throwError "The impossible happened! Got an empty list of context items when trying to validate them in inesToMemMap."
-	validateContextItems (i:is) = do
+	validateChunk :: [Chunk] -> ExceptT String IO Chunk
+	validateChunk [] = throwError "The impossible happened! Got an empty list of chunks when trying to validate them in inesToMemMap."
+	validateChunk (i:is) = do
 		case filter (\i' -> content i /= content i') is of
 			[] -> return ()
 			i':_ -> throwError
@@ -99,15 +99,17 @@ inesToMemMap src ines = do
 
 	buildMemMap prgA prgB = MemMap
 		{ cpu = M.fromList
-			$  [ (0x8000, Bytes prgA (hash prgA) 0)
-			   , (0xc000, Bytes prgB (hash prgB) 0)
+			$  [ (0x8000, chunkToMMI prgA)
+			   , (0xc000, chunkToMMI prgB)
 			   ]
 			++ cpuMirrors
 		, ppu = M.fromList (ppuMappings ++ ppuMirrors)
 		}
 
 	ppuMappings = zip [0x0000]
-		[Bytes bs (hash bs) 0 | bs <- chrs ines, BS.length bs == 0x2000]
+		[chunkToMMI bs | bs <- chrs ines, BS.length bs == 0x2000]
+
+	chunkToMMI bs = Bytes bs (hash bs) (Slice 0 (fromIntegral (BS.length bs)))
 
 	ppuMirrors = case mirroring (header ines) of
 		Horizontal -> [(0x2400, Mirror (Slice 0x2000 0x0400)), (0x2c00, Mirror (Slice 0x2800 0x0400))]
