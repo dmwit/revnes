@@ -68,9 +68,9 @@ app = App
 	, appAttrMap = const style
 	} where
 
-	draw ui = joinBorders . border
+	draw ui = joinBorders . borderWithLabel (title "Command line")
 		 $            renderEditor (vBox . map str)    (focus ui == CommandLine) (commandLine ui)
-		<=> hBorder
+		<=> hBorderWithLabel (title "Messages")
 		<=> vLimit 3 (renderList (const renderMessage) (focus ui == MessageLog ) (messageLog  ui))
 		<=> renderMemMapInfo ui
 
@@ -115,10 +115,13 @@ renderMemMapInfo ui = vBox
 emptyAttr :: AttrName
 emptyAttr = fromString "empty"
 
+title :: String -> Widget n
+title s = hBox [hLimit 3 hBorder, str (" " ++ s ++ " "), hBorder]
+
 -- | The first argument is a header/title.
 renderMap :: String -> (k -> v -> Widget n) -> Map k v -> Widget n
 renderMap s f m = vBox
-	$ hBox [hLimit 3 hBorder, str (" " ++ s ++ " "), hBorder]
+	$ title s
 	: if null m
 	  then [withAttr emptyAttr $ str "    (no entries)"]
 	  else map (uncurry f) (M.toAscList m)
