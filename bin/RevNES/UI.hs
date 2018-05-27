@@ -19,7 +19,7 @@ import qualified Data.Map as M
 
 import RevNES.MemMap
 
-data Focus = CommandLine | MessageLog | MemMapSources | MemMaps | MemMap
+data Focus = CommandLine | MessageLog
 	deriving (Bounded, Enum, Eq, Ord, Read, Show)
 
 data Severity = Success | Info | Warning | Error
@@ -89,7 +89,6 @@ app = App
 			(MessageLog , _) -> do
 				ml <- handleListEventVi handleListEvent e (messageLog ui)
 				continue ui { messageLog = ml }
-			_ -> continue ui
 		_ -> continue ui
 
 	style = attrMap defAttr
