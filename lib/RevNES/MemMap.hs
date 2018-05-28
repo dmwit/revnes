@@ -36,10 +36,11 @@ instance Default MemMap where def = MemMap def def
 
 type MemMaps = Map String MemMap
 
+type ChunkID = Digest SHA256
 data Chunk = Chunk
 	{ source :: Source
 	, content :: ByteString
 	, description :: String
 	} deriving (Eq, Ord, Show)
 
-type Chunks = Map (Digest SHA256) Chunk
+type Chunks = Map ChunkID Chunk
