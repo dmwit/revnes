@@ -24,6 +24,7 @@ module RevNES.Fold
 	) where
 
 import Control.Monad
+import Data.Default
 import Data.Foldable
 import Data.List
 import Data.IntervalMap (IntervalMap, Interval(..))
@@ -193,8 +194,7 @@ data Folds a = Folds
 -- Invariant: No empty 'FMF's. Plus the invariants outlined in the field
 -- descriptions above.
 
-empty :: Folds summary
-empty = Folds M.empty M.empty
+instance Default (Folds a) where def = Folds def def
 
 -- | Create a new fold, initially closed. May fail if the given key 'conflicts'
 -- with any existing key (or itself), in which case the set of conflicting keys

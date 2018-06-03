@@ -1,5 +1,6 @@
 module RevNES.PrettyPrint.Pseudo where
 
+import Data.Default
 import Data.Int
 import Data.Map (Map)
 import RevNES.Types
@@ -11,6 +12,8 @@ data PPEnvironment = PPEnvironment
 	{ variables :: Map Word16 String
 	, labels    :: Map Word16 String
 	} deriving (Eq, Ord, Read, Show)
+
+instance Default PPEnvironment where def = PPEnvironment def def
 
 pp :: PPEnvironment -> Word16 -> Instruction -> String
 pp env pc (JSR addr) = ppLabel env addr ++ "()"
