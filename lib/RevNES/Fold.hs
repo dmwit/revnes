@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 -- For now, this module is implemented in an inefficient way. There's lots of
 -- low-hanging fruit for improving the performance without changing the API too
 -- much.
@@ -18,7 +19,7 @@
 -- summary is the right one to show, even as the memory map changes out from
 -- under us, is quite tricky.
 module RevNES.Fold
-	( FMF, singleton, fromList, lengthFMF
+	( FMF, singleton, fromList, flatten, lengthFMF
 	, Folds, addFold, removeFold, view
 	) where
 
@@ -27,14 +28,16 @@ import Data.Foldable
 import Data.List
 import Data.IntervalMap (IntervalMap, Interval(..))
 import Data.Map (Map)
+import Data.Monoid
 import Data.Ord
 import Data.Set (Set)
-import Data.Tree
+import Data.Tree (Forest, Tree(..))
 import RevNES.MemMap
 
 import qualified Data.IntervalMap as IM
 import qualified Data.Map as M
 import qualified Data.Set as S
+import qualified RevNES.MemMap as MM
 
 -- | Notionally, this is a @[(ChunkID, Word64)]@ which specifies a map from
 -- 'Int's (e.g. offsets from some base CPU memory address) to a specific byte
@@ -80,6 +83,29 @@ singleton x@(chunk, slice) = FMF [x | size slice > 0]
 
 fromList :: [(ChunkID, Slice)] -> FMF
 fromList = foldMap singleton
+
+-- | Given a memory map (typically the result of 'cpu' or 'ppu') and a chunk of
+-- the memory to view, produce flattened fragments giving the source for each
+-- byte that is actually backed by a 'Source'. The 'Word16's in the result are
+-- addresses in the same address space as the 'Map' argument, and we guarantee
+-- that the 'FMF's do not abut, that is, that if a tail of the result is @(off,
+-- frag):(off':_):_@, then @off + lengthFMF frag < off'@.
+flatten :: Map Word16 MemMapItem -> Slice -> [(Word16, FMF)]
+flatten m s = go (offset s) where
+	end = min (2^16 - 1) $ offset s + min (2^16) (size s) - 1
+
+	go i
+		| i > end = []
+		| otherwise = case MM.lookup (fromIntegral i) m of
+			Empty memLoc -> go (i + min (2^16) (size memLoc))
+			Backed _ chunk chunkLoc _ -> cons
+				(i, singleton (chunk, chunkLoc { size = min (size chunkLoc) (end - i + 1) }))
+				(go (i + min (2^16) (size chunkLoc)))
+
+	cons ~(i, frag) [] = [(fromIntegral i, frag)]
+	cons ~(i, frag) vs@(~(i', frag'):rest)
+		| i + lengthFMF frag == fromIntegral i' = (fromIntegral i, frag <> frag'):rest
+		| otherwise = (fromIntegral i, frag):vs
 
 -- overflow
 lengthFMF :: FMF -> Word64
