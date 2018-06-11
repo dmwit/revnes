@@ -287,7 +287,7 @@ renderByteRegions brd = Widget Fixed Greedy $ do
 		Raw bs -> [ bugStr "tried hiding some rows of a single, raw, unfolded byte" | hide /= 0]
 		       ++ [ hBox
 		          	[ str . showDepth . regionDepth $ br
-		          	, withAttr labelAttr . str $ printf "       %04x " addr
+		          	, withAttr labelAttr . str $ printf "      %04x " addr
 		          	, withAttr openFoldAttr . str $ printf "0x%02x" byte
 		          	]
 		          | (addr, byte) <- zip [regionStart br..] $ BS.unpack (BS.take height bs)
@@ -302,7 +302,6 @@ renderByteRegions brd = Widget Fixed Greedy $ do
 				(True , False, _    ) -> "▲"
 				(True , True , False) -> "▲" ++ replicate (height-2) '\n' ++ "▼"
 				(True , True , True ) -> "♦"
-			, str " "
 			, if regionStart br < regionEnd br
 			  then renderLabel (regionStart br) <+> str "-"
 			  else str "     "
