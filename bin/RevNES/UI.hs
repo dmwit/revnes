@@ -17,6 +17,7 @@ import Data.Text.Zipper
 import Graphics.Vty.Attributes
 import Graphics.Vty.Input.Events
 import Lens.Micro.Mtl (view)
+import Numeric
 import Text.Printf
 import qualified Data.ByteString as BS
 import qualified Data.IntMap as IM
@@ -202,7 +203,8 @@ app = App
 			(CommandLine, EvKey KEnter []) -> do
 				let cl = commandLine ui
 				    ml = addMessage Info (head (getEditContents cl)) (messageLog ui)
-				continue (ui { commandLine = applyEdit clearZipper cl, messageLog = ml })
+				    ui' = handleCommand ui (head (getEditContents cl))
+				continue (ui' { commandLine = applyEdit clearZipper cl })
 			(CommandLine, _) -> do
 				cl <- handleEditorEvent e (commandLine ui)
 				continue ui { commandLine = cl }
@@ -221,6 +223,17 @@ app = App
 		, (openFoldAttr, fg yellow `withStyle` bold)
 		, (labelAttr, fg green)
 		]
+
+handleCommand :: UI -> String -> UI
+handleCommand ui s = case words s of
+	["goto", addrString] -> case readHex addrString of
+		[(addr, "")] | 0 <= addr && addr < 2^16
+			-> ui { cpuDisplay = (cpuDisplay ui) { topRegionStart = fromInteger addr } }
+		_ -> noParse
+	_ -> noParse
+	where
+	-- TODO: actual error reporting. bonus points for actual parsing.
+	noParse = ui { messageLog = addMessage Error ("Could not parse command: " ++ s) (messageLog ui) }
 
 renderTab :: UI -> Widget n
 renderTab ui = case tab ui of
