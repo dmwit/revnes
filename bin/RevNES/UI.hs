@@ -219,6 +219,7 @@ app = App
 		, (emptyAttr, fg brightBlue)
 		, (bugAttr, fg black <> bg red)
 		, (openFoldAttr, fg yellow `withStyle` bold)
+		, (labelAttr, fg green)
 		]
 
 renderTab :: UI -> Widget n
@@ -247,7 +248,7 @@ renderByteRegions brd = Widget Fixed Greedy $ do
 		Raw bs -> [ bugStr "tried hiding some rows of a single, raw, unfolded byte" | hide /= 0]
 		       ++ [ hBox
 		          	[ str . showDepth . regionDepth $ br
-		          	, str $ printf "       %04x " addr
+		          	, withAttr labelAttr . str $ printf "       %04x " addr
 		          	, withAttr openFoldAttr . str $ printf "0x%02x" byte
 		          	]
 		          | (addr, byte) <- zip [regionStart br..] $ BS.unpack (BS.take height bs)
@@ -263,8 +264,11 @@ renderByteRegions brd = Widget Fixed Greedy $ do
 				(True , True , False) -> "▲" ++ replicate (height-2) '\n' ++ "▼"
 				(True , True , True ) -> "♦"
 			, str " "
-			, str $ if regionStart br < regionEnd br then printf "%04x-" (regionStart br) else "     "
-			, str $ printf "%04x " (regionEnd br)
+			, if regionStart br < regionEnd br
+			  then renderLabel (regionStart br) <+> str "-"
+			  else str "     "
+			, renderLabel (regionEnd br)
+			, str " "
 			, withAttr closedFoldAttr . str . unlines . take height . drop hide $ sLines
 			] : go 0 (height+hide-len) brs
 
@@ -283,6 +287,13 @@ bugAttr = fromString "buggy behavior that users should never see"
 
 bugStr :: String -> Widget n
 bugStr = withAttr bugAttr . str . ("bug detected: "++)
+
+labelAttr :: AttrName
+labelAttr = fromString "code label"
+
+-- | For addresses that we think are probably code pointers.
+renderLabel :: Word16 -> Widget n
+renderLabel = withAttr labelAttr . str . printf "%04x"
 
 renderMemMapInfo :: UI -> Widget n
 renderMemMapInfo ui = vBox
