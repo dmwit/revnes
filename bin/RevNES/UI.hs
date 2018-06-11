@@ -4,6 +4,7 @@ import Brick
 import Brick.Widgets.Border
 import Brick.Widgets.Edit
 import Brick.Widgets.List
+import Data.ByteString (ByteString)
 import Data.Char
 import Data.Default
 import Data.IntMap (IntMap)
@@ -15,6 +16,7 @@ import Data.Tree (Forest, Tree(..))
 import Data.Text.Zipper
 import Graphics.Vty.Attributes
 import Graphics.Vty.Input.Events
+import Lens.Micro.Mtl (view)
 import Text.Printf
 import qualified Data.ByteString as BS
 import qualified Data.IntMap as IM
@@ -60,6 +62,44 @@ data FoldItem a = FoldItem
 data FoldContent = User String | Instruction Instruction
 	deriving (Eq, Ord, Read, Show)
 
+data BytesRepresentation = Raw ByteString | Folded FoldContent
+	deriving (Eq, Ord, Read, Show)
+
+data ByteRegion = ByteRegion
+	{ regionStart :: Word16
+	, regionEnd :: Word16
+	, regionDepth :: Int
+	, regionContent :: BytesRepresentation
+	} deriving (Eq, Ord, Read, Show)
+
+type ByteRegions = Map Word16 ByteRegion
+
+byteRegionZipper :: Word16 -> ByteRegions -> ([ByteRegion], Maybe ByteRegion, [ByteRegion])
+byteRegionZipper w brs = case splitLookupZipper w brs of
+	(lt@(ByteRegion { regionContent = Raw bs }):lts, Nothing, gts) | w <= regionEnd lt
+		-> let (b, e) = BS.splitAt (fromIntegral (w - regionStart lt)) bs
+		in ( lt { regionEnd = w-1, regionContent = Raw b }:lts
+		   , Just lt { regionStart = w, regionContent = Raw e }
+		   , gts)
+	(lt:lts, Nothing, gts) | w <= regionEnd lt -> (lts, Just lt, gts)
+	res -> res
+	where
+	splitLookupZipper a b = let (lt, eq, gt) = M.splitLookup a b
+	                        in (snd <$> M.toDescList lt, eq, snd <$> M.toAscList gt)
+
+data ByteRegionsDisplay = ByteRegionsDisplay
+	{ regions :: ByteRegions
+	, topRegionStart :: Word16
+	, hiddenLines :: Int
+	} deriving (Eq, Ord, Read, Show)
+
+instance Default ByteRegionsDisplay where
+	def = ByteRegionsDisplay
+		{ regions = def
+		, topRegionStart = 0
+		, hiddenLines = 0
+		}
+
 data UI = UI
 	{ focus :: Focus
 	, tab :: Tab
@@ -71,13 +111,9 @@ data UI = UI
 	, nextFoldID :: Int
 	, foldContents :: IntMap (FoldItem FoldContent)
 	, folds :: Folds Int
+	-- the ByteRegions contained in cpuDisplay is a cache of calling byteRegions
+	, cpuDisplay :: ByteRegionsDisplay
 	} deriving Show
-
-selectedMemMap :: UI -> MemMap
-selectedMemMap ui = M.findWithDefault def (selectedMemMapName ui) (memMaps ui)
-
-visibleMemMap :: UI -> MemMap
-visibleMemMap ui = M.findWithDefault def (visibleMemMapName ui) (memMaps ui)
 
 instance Default UI where
 	def = UI
@@ -92,7 +128,51 @@ instance Default UI where
 		, nextFoldID = minBound
 		, foldContents = def
 		, folds = def
+		, cpuDisplay = def
 		}
+
+selectedMemMap :: UI -> MemMap
+selectedMemMap ui = M.findWithDefault def (selectedMemMapName ui) (memMaps ui)
+
+visibleMemMap :: UI -> MemMap
+visibleMemMap ui = M.findWithDefault def (visibleMemMapName ui) (memMaps ui)
+
+byteRegions :: UI -> ByteRegions
+byteRegions ui = M.fromAscList
+	[ (regionStart br, br)
+	| (addr, frag) <- F.flatten memMap (Slice 0 (2^16))
+	, br <- byteRegionsForView addr 0 (Slice 0 (F.lengthFMF frag)) (F.view (folds ui) frag)
+	]
+	where
+	memMap = cpu (selectedMemMap ui)
+	-- addr never changes in recursive calls. other args do
+	byteRegionsForView addr depth Slice{size = 0} _ = []
+	byteRegionsForView addr depth slice [] =
+		let resolved = MM.lookup (addr + fromIntegral (offset slice)) memMap
+		    s = min (size slice) (size (memLoc resolved))
+		    recurse = byteRegionsForView addr depth (Slice (offset slice + s) (size slice - s)) []
+		in case resolved of
+		Empty{} -> recurse
+		Backed { bytes = bs } -> ByteRegion
+			{ regionStart = addr + fromIntegral (offset slice)
+			, regionEnd = addr + fromIntegral (offset slice + s - 1)
+			, regionDepth = depth
+			, regionContent = Raw (BS.take (fromIntegral s) bs)
+			} : recurse
+	byteRegionsForView addr depth slice ns@(Node (foldSlice, foldId) children:forest)
+		| offset slice < offset foldSlice
+			=  byteRegionsForView addr depth slice{ size = offset foldSlice - offset slice } []
+			++ byteRegionsForView addr depth (Slice (offset foldSlice) (offset slice + size slice - offset foldSlice)) ns
+		| open foldItem
+			=  byteRegionsForView addr (depth+1) foldSlice children
+			++ byteRegionsForView addr depth (Slice (offset foldSlice + size foldSlice) (size slice - size foldSlice)) forest
+		| otherwise = ByteRegion
+			{ regionStart = addr + fromIntegral (offset foldSlice)
+			, regionEnd = addr + fromIntegral (offset foldSlice + size foldSlice - 1)
+			, regionDepth = depth
+			, regionContent = Folded (item foldItem)
+			} : byteRegionsForView addr depth (Slice (offset foldSlice + size foldSlice) (size slice - size foldSlice)) forest
+		where foldItem = foldContents ui IM.! foldId
 
 addMessage :: Severity -> String -> List n Message -> List n Message
 addMessage s c = listMoveTo 0 . listInsert 0 (Message s c)
@@ -137,7 +217,7 @@ app = App
 		, (severityAttr Warning, fg yellow)
 		, (severityAttr Error  , fg red)
 		, (emptyAttr, fg brightBlue)
-		, (missingByteAttr, fg black <> bg red)
+		, (bugAttr, fg black <> bg red)
 		, (openFoldAttr, fg yellow `withStyle` bold)
 		]
 
@@ -147,61 +227,50 @@ renderTab ui = case tab ui of
 	Maps -> renderMemMapInfo ui
 
 renderCPUMemory :: UI -> Widget n
-renderCPUMemory ui = vBox
-	$ title "CPU memory"
-	: renderedFrags
+renderCPUMemory ui
+	=   title "CPU memory"
+	<=> renderByteRegions (cpuDisplay ui)
+
+renderByteRegions :: ByteRegionsDisplay -> Widget n
+renderByteRegions brd = Widget Fixed Greedy $ do
+	h <- view availHeightL
+	case byteRegionZipper (topRegionStart brd) (regions brd) of
+		(_, Nothing, brs) -> render . vBox $ go 0 h brs
+		(_, Just br, brs) -> render . vBox $ go (hiddenLines brd) h (br:brs)
 	where
-	memMap = cpu (selectedMemMap ui)
-	renderedFrags = concatMap (renderFrag ui) $ F.flatten memMap (Slice 0 (2^16))
-
-renderFrag :: UI -> (Word16, FMF) -> [Widget n]
-renderFrag ui ~(addr, frag) = concatMap renderFold summarized
-	where
-	foldItems = fmap (\(slice, foldID) ->
-	            	( slice { offset = offset slice + fromIntegral addr }
-	            	, foldContents ui IM.! foldID
-	            	)
-	            ) <$> F.view (folds ui) frag
-	summarized = summarizeFolds (Slice (fromIntegral addr) (F.lengthFMF frag)) foldItems
-	memMap = cpu $ selectedMemMap ui
-
-	renderFold (slice, depth, Just fc) = return
-		. renderRow depth (offset slice)
-		$ withAttr closedFoldAttr (renderFoldContent (offset slice) fc)
-	renderFold (Slice { size = 0 }, _, _) = []
-	renderFold (slice, depth, Nothing) =
-		let backing = MM.lookup (fromIntegral (offset slice)) memMap
-		    slice' = memLoc backing
-		    sz = min (size slice) (size slice')
-		    nextSlice = Slice (offset slice + size slice') (size slice - sz)
-		    remainingBytes = renderFold (nextSlice, depth, Nothing)
-		    addrs = [offset slice .. offset slice + sz - 1]
-		    rows = case backing of
-		    	-- should be impossible, but...
-		    	Empty slice' -> repeat unknownByte
-		    	Backed { bytes = bs } -> withAttr openFoldAttr . str . printf "0x%02x" <$> BS.unpack bs
-		in zipWith3 renderRow (repeat depth) addrs rows ++ remainingBytes
-
-	unknownByte = withAttr missingByteAttr (str "???? (report a bug, please)")
-	renderRow depth addr widget = str (printf "%s 0x%04x " (showDepth depth) addr) <+> widget
-
-	renderFoldContent addr (User lbl) = str lbl
-	-- TODO: not def
-	renderFoldContent addr (Instruction i) = str (pp def (fromIntegral addr) i)
+	go _ 0 _ = []
+	go _ _ [] = []
+	go hide height (br:brs) = case regionContent br of
+		-- TODO: not def
+		Folded (Instruction i) -> recurse (pp def (regionStart br) i)
+		Folded (User s) -> recurse s
+		Raw bs -> [ bugStr "tried hiding some rows of a single, raw, unfolded byte" | hide /= 0]
+		       ++ [ hBox
+		          	[ str . showDepth . regionDepth $ br
+		          	, str $ printf "       %04x " addr
+		          	, withAttr openFoldAttr . str $ printf "0x%02x" byte
+		          	]
+		          | (addr, byte) <- zip [regionStart br..] $ BS.unpack (BS.take height bs)
+		          ]
+		       ++ go 0 (height-BS.length bs) brs
+		where
+		recurse s = let sLines = lines s; len = length sLines in hBox
+			[ str . showDepth . regionDepth $ br
+			, str $ case (hide > 0, len - hide > height, height < 2) of
+				(False, False, _    ) -> " "
+				(False, True , _    ) -> replicate (height-1) '\n' ++ "▼"
+				(True , False, _    ) -> "▲"
+				(True , True , False) -> "▲" ++ replicate (height-2) '\n' ++ "▼"
+				(True , True , True ) -> "♦"
+			, str " "
+			, str $ if regionStart br < regionEnd br then printf "%04x-" (regionStart br) else "     "
+			, str $ printf "%04x " (regionEnd br)
+			, withAttr closedFoldAttr . str . unlines . take height . drop hide $ sLines
+			] : go 0 (height+hide-len) brs
 
 	showDepth n | n < 1 = " "
 	            | n < 10 = show n
 	            | otherwise = "+"
-
--- assumes each slice of the forest is completely contained in the first argument slice
-summarizeFolds :: Slice -> Forest (Slice, FoldItem a) -> [(Slice, Int, Maybe a)]
-summarizeFolds s [] = [(s, 0, Nothing) | size s > 0]
-summarizeFolds s (Node (s', v) children:forest) = prefix ++ node ++ suffix where
-	prefix = [(s { size = offset s' - offset s }, 0, Nothing) | offset s' > offset s]
-	suffix = summarizeFolds (Slice (offset s' + size s') (offset s + size s - offset s' - size s')) forest
-	node = if open v
-	       then [(s, depth+1, ma) | (s, depth, ma) <- summarizeFolds s' children]
-	       else [(s', 1, Just (item v))]
 
 closedFoldAttr :: AttrName
 closedFoldAttr = fromString "closed fold"
@@ -209,8 +278,11 @@ closedFoldAttr = fromString "closed fold"
 openFoldAttr :: AttrName
 openFoldAttr = fromString "open fold"
 
-missingByteAttr :: AttrName
-missingByteAttr = fromString "missing byte"
+bugAttr :: AttrName
+bugAttr = fromString "buggy behavior that users should never see"
+
+bugStr :: String -> Widget n
+bugStr = withAttr bugAttr . str . ("bug detected: "++)
 
 renderMemMapInfo :: UI -> Widget n
 renderMemMapInfo ui = vBox
