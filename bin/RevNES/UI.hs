@@ -216,8 +216,8 @@ app = App
 	style = attrMap defAttr
 		[ (listSelectedFocusedAttr, currentAttr `withStyle` bold)
 		, (severityAttr Success, fg green)
-		, (severityAttr Warning, fg yellow)
-		, (severityAttr Error  , fg red)
+		, (severityAttr Warning, fg magenta `withStyle` bold)
+		, (severityAttr Error  , fg red `withStyle` bold)
 		, (emptyAttr, fg brightBlue)
 		, (bugAttr, fg black <> bg red)
 		, (openFoldAttr, fg yellow `withStyle` bold)
