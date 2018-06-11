@@ -226,14 +226,40 @@ app = App
 
 handleCommand :: UI -> String -> UI
 handleCommand ui s = case words s of
-	["goto", addrString] -> case readHex addrString of
-		[(addr, "")] | 0 <= addr && addr < 2^16
-			-> ui { cpuDisplay = (cpuDisplay ui) { topRegionStart = fromInteger addr } }
+	[] -> ui
+	["goto", addrString] -> case readAddr addrString of
+		Just addr -> ui { cpuDisplay = (cpuDisplay ui) { topRegionStart = addr } }
+		_ -> noParse
+	"fold":startAddrString:endAddrString:summary -> case mapM readAddr [startAddrString, endAddrString] of
+		Just [startAddr, endAddr] | endAddr > startAddr -> case F.flatten (cpu (selectedMemMap ui)) (Slice (fromIntegral startAddr) (fromIntegral (endAddr - startAddr + 1))) of
+			[(addr, fmf)] | addr == startAddr && F.lengthFMF fmf == fromIntegral (endAddr - startAddr + 1)
+				-> case F.addFold fmf (nextFoldID ui) (folds ui) of
+					-- TODO: this error could use some beautification
+					Left conflicts -> complain $ printf "Folding %04x-%04x would conflict with existing fold(s): %s" startAddr endAddr (show conflicts)
+					Right folds' -> let
+						ui' = ui
+							{ nextFoldID = nextFoldID ui + 1
+							, foldContents = IM.insert (nextFoldID ui) (FoldItem False (User (unwords summary))) (foldContents ui)
+							, folds = folds'
+							, cpuDisplay = (cpuDisplay ui) { regions = byteRegions ui' }
+							, messageLog = addMessage Success (printf "Created fold around %04x-%04x" startAddr endAddr) (messageLog ui)
+							}
+						in ui'
+			_ -> complain $ printf "Address range %04x-%04x includes unmapped memory" startAddr endAddr
 		_ -> noParse
 	_ -> noParse
 	where
 	-- TODO: actual error reporting. bonus points for actual parsing.
-	noParse = ui { messageLog = addMessage Error ("Could not parse command: " ++ s) (messageLog ui) }
+	noParse :: UI
+	noParse = complain ("Could not parse command: " ++ s)
+
+	complain :: String -> UI
+	complain err = ui { messageLog = addMessage Error err (messageLog ui) }
+
+	readAddr :: String -> Maybe Word16
+	readAddr s = case readHex s of
+		[(addr, "")] | 0 <= addr && addr < 2^16 -> Just (fromInteger addr)
+		_ -> Nothing
 
 renderTab :: UI -> Widget n
 renderTab ui = case tab ui of
