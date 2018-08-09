@@ -25,6 +25,7 @@ library
                        RevNES.MemMap.INES,
                        RevNES.Parse,
                        RevNES.PrettyPrint.Pseudo,
+                       RevNES.Slice,
                        RevNES.Types
   -- other-modules:       
   -- other-extensions:    

@@ -1,9 +1,12 @@
 module RevNES.UI where
 
+import RevNES.Debug.Trace
+
 import Brick
 import Brick.Widgets.Border
 import Brick.Widgets.Edit
 import Brick.Widgets.List
+import Control.Monad
 import Data.ByteString (ByteString)
 import Data.Char
 import Data.Default
@@ -27,6 +30,7 @@ import qualified Data.Vector as V
 import RevNES.Fold (FMF, Folds)
 import RevNES.MemMap
 import RevNES.PrettyPrint.Pseudo (pp)
+import RevNES.Slice
 import RevNES.Types
 import qualified RevNES.Fold as F
 import qualified RevNES.MemMap as MM
@@ -66,6 +70,7 @@ data FoldContent = User String | Instruction Instruction
 data BytesRepresentation = Raw ByteString | Folded FoldContent
 	deriving (Eq, Ord, Read, Show)
 
+-- TODO: use a Slice16 instead of regionStart, regionEnd
 data ByteRegion = ByteRegion
 	{ regionStart :: Word16
 	, regionEnd :: Word16
@@ -141,39 +146,57 @@ visibleMemMap ui = M.findWithDefault def (visibleMemMapName ui) (memMaps ui)
 byteRegions :: UI -> ByteRegions
 byteRegions ui = M.fromAscList
 	[ (regionStart br, br)
-	| (addr, frag) <- F.flatten memMap (Slice 0 (2^16))
-	, br <- byteRegionsForView addr 0 (Slice 0 (F.lengthFMF frag)) (F.view (folds ui) frag)
+	| (addr, frag) <- F.flatten memMap full
+	, let addrU = toInteger addr
+	, br <- byteRegionsForView 0
+		(bB <$> fromStartSize addrU (F.lengthFMF frag))
+		(lower addrU (F.view (folds ui) frag))
 	]
 	where
 	memMap = cpu (selectedMemMap ui)
-	-- addr never changes in recursive calls. other args do
-	byteRegionsForView addr depth Slice{size = 0} _ = []
-	byteRegionsForView addr depth slice [] =
-		let resolved = MM.lookup (addr + fromIntegral (offset slice)) memMap
-		    s = min (size slice) (size (memLoc resolved))
-		    recurse = byteRegionsForView addr depth (Slice (offset slice + s) (size slice - s)) []
+
+	lower :: Integer -> Forest (SliceU, Int) -> Forest (Slice16, Int)
+	lower addrU = go where
+		go [] = []
+		go (Node (sU, ix) children:rest) = case b (endFromStartU start' sU) of
+			Nothing | start' < 2^16 -> go children
+			        | otherwise -> []
+			Just s16 -> Node (s16, ix) (go children) : go rest
+			where start' = addrU + start sU
+
+	byteRegionsForView :: Int -> Maybe Slice16 -> Forest (Slice16, Int) -> [ByteRegion]
+	byteRegionsForView depth Nothing _ = []
+	byteRegionsForView depth (Just slice) [] =
+		let resolved = MM.lookup (start slice) memMap
+		    sm1 = min (sizem116 slice) (sizem116 (memLoc resolved))
+		    nextSlice = startFromSize (sizem116 slice - sm1) slice
+		    recurse = byteRegionsForView depth nextSlice []
 		in case resolved of
 		Empty{} -> recurse
 		Backed { bytes = bs } -> ByteRegion
-			{ regionStart = addr + fromIntegral (offset slice)
-			, regionEnd = addr + fromIntegral (offset slice + s - 1)
+			{ regionStart = start slice
+			, regionEnd = start slice + sm1
 			, regionDepth = depth
-			, regionContent = Raw (BS.take (fromIntegral s) bs)
+			, regionContent = Raw (BS.take (fromIntegral sm1 + 1) bs)
 			} : recurse
-	byteRegionsForView addr depth slice ns@(Node (foldSlice, foldId) children:forest)
-		| offset slice < offset foldSlice
-			=  byteRegionsForView addr depth slice{ size = offset foldSlice - offset slice } []
-			++ byteRegionsForView addr depth (Slice (offset foldSlice) (offset slice + size slice - offset foldSlice)) ns
+	byteRegionsForView depth (Just slice) ns@(Node (foldSlice, foldId) children:forest)
+		| start slice < start foldSlice
+			=  byteRegionsForView depth (sizeFromEnd (start foldSlice - 1) slice) []
+			++ byteRegionsForView depth (sizeFromStart (start foldSlice) slice) ns
 		| open foldItem
-			=  byteRegionsForView addr (depth+1) foldSlice children
-			++ byteRegionsForView addr depth (Slice (offset foldSlice + size foldSlice) (size slice - size foldSlice)) forest
+			=  byteRegionsForView (depth+1) (Just foldSlice) children
+			++ byteRegionsForView depth afterFoldSlice forest
 		| otherwise = ByteRegion
-			{ regionStart = addr + fromIntegral (offset foldSlice)
-			, regionEnd = addr + fromIntegral (offset foldSlice + size foldSlice - 1)
+			{ regionStart = start foldSlice
+			, regionEnd = end foldSlice
 			, regionDepth = depth
 			, regionContent = Folded (item foldItem)
-			} : byteRegionsForView addr depth (Slice (offset foldSlice + size foldSlice) (size slice - size foldSlice)) forest
-		where foldItem = foldContents ui IM.! foldId
+			} : byteRegionsForView depth afterFoldSlice forest
+		where
+		foldItem = foldContents ui IM.! foldId
+		afterFoldSlice = do
+			guard (end foldSlice + 1 > end foldSlice)
+			sizeFromStart (end foldSlice + 1) slice
 
 addMessage :: Severity -> String -> List n Message -> List n Message
 addMessage s c = listMoveTo 0 . listInsert 0 (Message s c)
@@ -231,7 +254,7 @@ handleCommand ui s = case words s of
 		Just addr -> ui { cpuDisplay = (cpuDisplay ui) { topRegionStart = addr } }
 		_ -> noParse
 	"fold":startAddrString:endAddrString:summary -> case mapM readAddr [startAddrString, endAddrString] of
-		Just [startAddr, endAddr] | endAddr > startAddr -> case F.flatten (cpu (selectedMemMap ui)) (Slice (fromIntegral startAddr) (fromIntegral (endAddr - startAddr + 1))) of
+		Just [startAddr, endAddr] | Just s <- fromStartEnd startAddr endAddr -> case F.flatten (cpu (selectedMemMap ui)) s of
 			[(addr, fmf)] | addr == startAddr && F.lengthFMF fmf == fromIntegral (endAddr - startAddr + 1)
 				-> case F.addFold fmf (nextFoldID ui) (folds ui) of
 					-- TODO: this error could use some beautification
@@ -245,7 +268,7 @@ handleCommand ui s = case words s of
 							, messageLog = addMessage Success (printf "Created fold around %04x-%04x" startAddr endAddr) (messageLog ui)
 							}
 						in ui'
-			_ -> complain $ printf "Address range %04x-%04x includes unmapped memory" startAddr endAddr
+			v -> traceShow v $ complain $ printf "Address range %04x-%04x includes unmapped memory" startAddr endAddr
 		_ -> noParse
 	_ -> noParse
 	where
@@ -372,16 +395,21 @@ renderChunk hash item =
 renderSource :: Source -> Widget n
 renderSource = go id where
 	go f (Zip fp s) = go (f . (fp++) . (':':)) s
-	go f (File fp s) = str (f fp) <=> renderSlice s
+	go f (File fp s) = str (f fp) <=> renderSliceU s
 
 renderMemMapItem :: String -> Chunks -> Word16 -> MemMapItem -> Widget n
 renderMemMapItem memTy chunks start item = hBox
-	[ renderSlice16 s { offset = fromIntegral start }
+	[ renderedMemorySlice
 	, str " ▶ "
-	, renderSlice16 s
+	, renderedTargetSlice
 	, str (" (" ++ source ++ ")")
 	] where
-	s = mmiSlice item
+	renderedMemorySlice = renderSlice16 $ case item of
+		Bytes _ _ loc -> bB . endFromStartU (fromIntegral start) $ loc
+		Mirror loc -> endFromStartB start loc
+	renderedTargetSlice = case item of
+		Bytes _ _ loc -> renderSliceU loc
+		Mirror loc -> renderSlice16 loc
 	describe chunk = ": " ++ description chunk
 	source = case item of
 		Mirror _ -> memTy
@@ -394,11 +422,11 @@ renderMemMapName selected visible current _ = str $ current ++ case (current == 
 	(True , False) -> " (visible)"
 	(True , True ) -> " (selected, visible)"
 
-renderSlice :: Slice -> Widget n
-renderSlice s = str $ printf "0x%x-0x%x" (offset s) (toInteger (offset s) + toInteger (size s) - 1)
+renderSliceU :: SliceU -> Widget n
+renderSliceU s = str $ printf "0x%x-0x%x" (start s) (end s)
 
-renderSlice16 :: Slice -> Widget n
-renderSlice16 s = str $ printf "0x%04x-0x%04x" (offset s) (offset s+size s-1)
+renderSlice16 :: Slice16 -> Widget n
+renderSlice16 s = str $ printf "0x%04x-0x%04x" (start s) (end s)
 
 renderHash :: Digest SHA256 -> Widget n
 renderHash = str . show

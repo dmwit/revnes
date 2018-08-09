@@ -27,17 +27,19 @@ import Control.Monad
 import Data.Default
 import Data.Foldable
 import Data.List
-import Data.IntervalMap (IntervalMap, Interval(..))
+import Data.IntervalMap.Generic.Lazy (IntervalMap)
 import Data.Map (Map)
 import Data.Monoid
 import Data.Ord
 import Data.Set (Set)
 import Data.Tree (Forest, Tree(..))
+import RevNES.Slice hiding (singleton)
 import RevNES.MemMap
 
-import qualified Data.IntervalMap as IM
+import qualified Data.IntervalMap.Generic.Lazy as IM
 import qualified Data.Map as M
 import qualified Data.Set as S
+import qualified RevNES.Slice as Slice
 import qualified RevNES.MemMap as MM
 
 -- | Notionally, this is a @[(ChunkID, Word64)]@ which specifies a map from
@@ -52,12 +54,10 @@ import qualified RevNES.MemMap as MM
 -- no mirroring, fragment because it's required to talk about every address in
 -- the range and so there will be in general many fragments in disparate parts
 -- of the NES' address space.
-newtype FMF = FMF [(ChunkID, Slice)] deriving (Eq, Show)
--- Two invariants:
--- 1. No empty slices (all 'size's are > 0).
--- 2. Adjacent elements can't be collapsed, that is, they either have different
---    'ChunkID's or the end of the first one's slice is not one smaller than
---    the start of the second one's slice.
+newtype FMF = FMF [(ChunkID, SliceU)] deriving (Eq, Show)
+-- Invariant: adjacent elements can't be collapsed, that is, they either have
+-- different 'ChunkID's or the end of the first one's slice is not one smaller
+-- than the start of the second one's slice.
 
 -- | @a <= a <\> b@; otherwise lexicographic
 instance Ord FMF where
@@ -72,17 +72,16 @@ instance Monoid FMF where
 	mappend (FMF vs) (FMF vs') = FMF (go vs vs') where
 		go [] vs = vs
 		go [v@(chunk, slice)] ((v'@(chunk', slice')):rest) = (++rest)
-			-- overflow
-			$ (if chunk == chunk' && offset slice + size slice == offset slice'
-			   then [(chunk, slice { size = size slice + size slice' })]
+			$ (if chunk == chunk' && end slice + 1 == start slice'
+			   then [(chunk, endFromSizem1U (sizem1U slice + sizem1U slice' + 1) slice)]
 			   else [v, v']
 			  )
 		go (v:vs) vs' = v:go vs vs'
 
-singleton :: (ChunkID, Slice) -> FMF
-singleton x@(chunk, slice) = FMF [x | size slice > 0]
+singleton :: (ChunkID, SliceU) -> FMF
+singleton x = FMF [x]
 
-fromList :: [(ChunkID, Slice)] -> FMF
+fromList :: [(ChunkID, SliceU)] -> FMF
 fromList = foldMap singleton
 
 -- | Given a memory map (typically the result of 'cpu' or 'ppu') and a chunk of
@@ -91,26 +90,29 @@ fromList = foldMap singleton
 -- addresses in the same address space as the 'Map' argument, and we guarantee
 -- that the 'FMF's do not abut, that is, that if a tail of the result is @(off,
 -- frag):(off':_):_@, then @off + lengthFMF frag < off'@.
-flatten :: Map Word16 MemMapItem -> Slice -> [(Word16, FMF)]
-flatten m s = go (offset s) where
-	end = min (2^16 - 1) $ offset s + min (2^16) (size s) - 1
-
+flatten :: Map Word16 MemMapItem -> Slice16 -> [(Word16, FMF)]
+flatten m s = go (start s) where
 	go i
-		| i > end = []
-		| otherwise = case MM.lookup (fromIntegral i) m of
-			Empty memLoc -> go (i + min (2^16) (size memLoc))
-			Backed _ chunk chunkLoc _ -> cons
-				(i, singleton (chunk, chunkLoc { size = min (size chunkLoc) (end - i + 1) }))
-				(go (i + min (2^16) (size chunkLoc)))
+		| i > end s = []
+		| otherwise = case MM.lookup i m of
+			Empty memLoc -> next i memLoc
+			Backed _ chunk chunkLoc memLoc -> cons i
+				(foldMap (\s -> singleton (chunk, s))
+				         (sizeFromEnd (min (end chunkLoc) (toInteger (end s))) chunkLoc)
+				)
+				(next i memLoc)
+	next i slice =
+		let i' = i + sizem116 slice + 1 in
+		if i' <= i then [] else go i'
 
-	cons ~(i, frag) [] = [(fromIntegral i, frag)]
-	cons ~(i, frag) vs@(~(i', frag'):rest)
-		| i + lengthFMF frag == fromIntegral i' = (fromIntegral i, frag <> frag'):rest
-		| otherwise = (fromIntegral i, frag):vs
+	cons i (FMF []) vs = vs
+	cons i frag [] = [(i, frag)]
+	cons i frag vs@(~(i', frag'):rest)
+		| i + fromInteger (lengthFMF frag) == i' = (i, frag <> frag'):rest
+		| otherwise = (i, frag):vs
 
--- overflow
-lengthFMF :: FMF -> Word64
-lengthFMF (FMF vs) = foldl' (+) 0 [size slice | (_, slice) <- vs]
+lengthFMF :: FMF -> Integer
+lengthFMF (FMF vs) = foldl' (\n (_, s) -> n + sizeU s) 0 vs
 
 -- | Two fragments conflict if a non-empty strict prefix of one is a strict
 -- suffix of the other. Note that a thing can conflict with itself!
@@ -119,18 +121,14 @@ conflicts (FMF vs) (FMF vs') = (go vs vs' || go vs' vs) where
 	go vs vs' = any (`isFMFPrefixOf` vs') (strictTails vs)
 
 	strictTails [] = [[]]
-	-- should never happen due to invariant (1), but...
-	strictTails ((_, Slice { size = 0 }):rest) = strictTails rest
-	strictTails ((_, Slice { size = 1 }):rest) = tails rest
-	strictTails ((chunk, slice):rest) = tails ((chunk, slice'):rest) where
-		-- overflow in the addition, maybe? the subtraction should be fine
-		slice' = Slice { offset = offset slice + 1, size = size slice - 1 }
+	strictTails ((chunk, slice):rest) = case sizeFromStart (start slice + 1) slice of
+		Nothing -> tails rest
+		Just slice' -> tails ((chunk, slice'):rest)
 
 	isFMFPrefixOf ((chunk, slice):rest) ((chunk', slice'):rest')
 		| chunk == chunk'
-		&& offset slice <= offset slice'
-		-- overflow
-		= case (rest, compare (offset slice + size slice) (offset slice' + size slice')) of
+		&& start slice <= start slice'
+		= case (rest, compare (end slice) (end slice')) of
 		  	(_, EQ) -> rest `isStrictPrefixOf` rest'
 		  	([], LT) -> True
 		  	_ -> False
@@ -140,10 +138,9 @@ conflicts (FMF vs) (FMF vs') = (go vs vs' || go vs' vs) where
 	isStrictPrefixOf [] vs' = not (null vs')
 	isStrictPrefixOf [(chunk, slice)] ((chunk', slice'):rest')
 		= chunk == chunk'
-		&& offset slice == offset slice'
-		&& (  size slice < size slice'
-		   -- this @not (null rest)@ check relies on invariant (1)
-		   || (size slice == size slice' && not (null rest'))
+		&& start slice == start slice'
+		&& (  end slice < end slice'
+		   || (end slice == end slice' && not (null rest'))
 		   )
 	isStrictPrefixOf ((chunk, slice):rest) [] = False
 	isStrictPrefixOf (v:rest) (v':rest') = v == v' && isStrictPrefixOf rest rest'
@@ -163,17 +160,13 @@ sharedPrefix (FMF a) (FMF b) = (FMF shared, FMF asuf, FMF bsuf) where
 	go (v@(chunk, slice):rest) (v'@(chunk', slice'):rest')
 		| v == v'
 			= let ~(shared, suf, suf') = go rest rest' in (v:shared, suf, suf')
-		| chunk == chunk' && offset slice == offset slice'
-			= ( [(chunk, slice { size = smallSize })]
-			  , [(chunk, Slice newOffset newSize ) | newSize  /= 0] ++ rest
-			  , [(chunk, Slice newOffset newSize') | newSize' /= 0] ++ rest'
+		| chunk == chunk' && start slice == start slice'
+			= ( [(chunk, min slice slice')]
+			  , maybe id (:) ((,) chunk <$> fromStartEnd start' (end slice )) rest
+			  , maybe id (:) ((,) chunk <$> fromStartEnd start' (end slice')) rest'
 			  )
 			where
-			smallSize = min (size slice) (size slice')
-			-- overflow
-			newOffset = offset slice + smallSize
-			newSize  = size slice  - smallSize
-			newSize' = size slice' - smallSize
+			start' = min (end slice) (end slice') + 1
 	go a b = ([], a, b)
 
 -- | Notionally, a @Map FMF a@. However, we maintain an invariant that all
@@ -186,10 +179,10 @@ sharedPrefix (FMF a) (FMF b) = (FMF shared, FMF asuf, FMF bsuf) where
 data Folds a = Folds
 	-- fragments: for a given chunk, a map from intervals in that chunk to all
 	-- the 'FMF's that contain the given interval
-	{ fragments :: Map ChunkID (IntervalMap Word64 (Set FMF)) -- poor man's suffix tree
+	{ fragments :: Map ChunkID (IntervalMap SliceU (Set FMF)) -- poor man's suffix tree
 	-- starts: for a given chunk, a map from offsets in that chunk to all the
 	-- folds that start at the given offset
-	, starts :: Map ChunkID (Map Word64 (Map FMF a)) -- poor man's RLE trie
+	, starts :: Map ChunkID (Map Integer (Map FMF a)) -- poor man's RLE trie
 	} deriving (Eq, Ord, Show)
 -- Invariant: No empty 'FMF's. Plus the invariants outlined in the field
 -- descriptions above.
@@ -215,31 +208,29 @@ addFold fragment a folds = case S.filter (conflicts fragment) candidates of
 
 -- The only possible conflicts are existing keys that contain the first byte or
 -- last byte of the fragment, or the new key itself.
-possibleConflicts :: FMF -> Map ChunkID (IntervalMap Word64 (Set FMF)) -> Set FMF
+possibleConflicts :: FMF -> Map ChunkID (IntervalMap SliceU (Set FMF)) -> Set FMF
 possibleConflicts      (FMF []) frags = S.empty
 possibleConflicts frag@(FMF vs) frags = S.unions ([S.singleton frag] ++ fmfs ++ fmfs') where
 	(chunk , slice ):_ = vs
 	(chunk', slice'):_ = reverse vs
 	fmfs  = IM.elems $ IM.containing
 		(M.findWithDefault IM.empty chunk  frags)
-		(offset slice)
+		(start slice)
 	fmfs' = IM.elems $ IM.containing
 		(M.findWithDefault IM.empty chunk' frags)
-		-- overflow
-		(offset slice' + size slice' - 1)
+		(end slice')
 
-fragmentsFromFragment :: FMF -> Map ChunkID (IntervalMap Word64 (Set FMF))
+fragmentsFromFragment :: FMF -> Map ChunkID (IntervalMap SliceU (Set FMF))
 fragmentsFromFragment fragment@(FMF vs) = M.fromListWith (IM.unionWith S.union)
-	-- overflow
-	[ (chunk, IM.singleton (IntervalCO o (o+s)) (S.singleton fragment))
-	| (chunk, Slice { offset = o, size = s }) <- vs
+	[ (chunk, IM.singleton slice (S.singleton fragment))
+	| (chunk, slice) <- vs
 	]
 
-startsFromFragment :: FMF -> a -> Map ChunkID (Map Word64 (Map FMF a))
+startsFromFragment :: FMF -> a -> Map ChunkID (Map Integer (Map FMF a))
 startsFromFragment (FMF []) a = M.empty
 startsFromFragment fragment@(FMF ((chunk, slice):_)) a = id
 	. M.singleton chunk
-	. M.singleton (offset slice)
+	. M.singleton (start slice)
 	. M.singleton fragment
 	$ a
 
@@ -257,31 +248,31 @@ removeFold fragment folds = folds
 -- | Given a fragment of the current memory map, produce the tree of folds. The
 -- returned 'Slice's are indices into the argument 'FMF'. 'Slice's at any given
 -- level of the returned tree do not overlap.
-view :: Folds a -> FMF -> Forest (Slice, a)
+view :: Folds a -> FMF -> Forest (SliceU, a)
 view folds (FMF vs) = findFolds (starts folds) 0 vs where
-	-- overflow many places in this where block
 	findFolds ss i [] = []
 	findFolds ss i ((chunk, slice):rest) = case M.lookup chunk ss of
-		Nothing -> findFolds ss (i+size slice) rest
-		Just m -> case M.splitLookup (offset slice) m of
+		Nothing -> findFolds ss (i+sizeU slice) rest
+		Just m -> case M.splitLookup (start slice) m of
 			(_, mfrags, fragss) -> findFoldsStarting ss i chunk slice rest
-				(foldMap (\frags -> [(offset slice, frags)]) mfrags ++ M.toAscList fragss)
+				(foldMap (\frags -> [(start slice, frags)]) mfrags ++ M.toAscList fragss)
 
-	findFoldsStarting ss i chunk slice rest [] = findFolds ss (i+size slice) rest
-	findFoldsStarting ss i chunk slice rest ((offset', frags):offfrags)
-		| offset slice + size slice < offset' = findFolds ss (i+size slice) rest
+	findFoldsStarting ss i chunk slice rest [] = findFolds ss (i+sizeU slice) rest
+	findFoldsStarting ss i chunk slice rest ((start', frags):offfrags)
+		| end slice < start' = findFolds ss (i+sizeU slice) rest
 		| otherwise = case [ (frag, rest', a)
 		                   | (frag@(FMF ((_, slice'):_)), a) <- M.toDescList frags
-		                   , Just (FMF rest') <- [splitPrefixFMF frag (FMF ((chunk, slice' { size = offset slice + size slice - offset slice' }):rest))]
+		                   , Just shortSlice <- [sizeFromStart (start slice') slice]
+		                   , Just (FMF rest') <- [splitPrefixFMF frag (FMF ((chunk, shortSlice):rest))]
 		                   ]
 		              of
-			(frag@(FMF vs@((_, slice'):_)), rest', a):_ ->
+			(frag@(FMF vs'@((_, slice'):_)), rest', a):_ ->
 				let sz = lengthFMF frag
 				    ss' = ( flip M.adjust chunk
-				          . flip M.adjust offset'
+				          . flip M.adjust start'
 				          $ M.delete frag
 				          ) ss
-				    i' = i+offset slice'-offset slice
-				in Node (Slice i' sz, a) (findFolds ss' i' vs)
+				    i' = i+start slice'-start slice
+				in Node (fromStartSizeBU i' sz, a) (findFolds ss' i' vs')
 				:  findFolds ss (i'+sz) rest'
 			_ -> findFoldsStarting ss i chunk slice rest offfrags

@@ -14,6 +14,7 @@ import Data.Foldable
 import Data.List
 import Data.Map (Map)
 import Data.Word
+import RevNES.Slice
 import RevNES.MemMap
 import System.FilePath
 import qualified Data.Attoparsec.ByteString.Lazy as P
@@ -37,7 +38,7 @@ loadZip fp = do
 		entries -> throwError (fp ++ " contains multiple files named *.nes: " ++ show entries)
 	loadByteString (Zip fp . File (eRelativePath entry)) (fromEntry entry)
 
-loadByteString :: (Slice -> Source) -> LBS.ByteString -> ExceptT String IO (Mapper, Chunks, MemMap)
+loadByteString :: (SliceU -> Source) -> LBS.ByteString -> ExceptT String IO (Mapper, Chunks, MemMap)
 loadByteString src bs = case parse parseINES bs of
 	Done rest ines
 		| rest == LBS.empty -> inesToMemMap src ines
@@ -50,14 +51,14 @@ loadByteString src bs = case parse parseINES bs of
 		++ intercalate "," ctxts ++ "\n\t"
 		++ err
 
-inesToMemMap :: (Slice -> Source) -> INES -> ExceptT String IO (Mapper, Chunks, MemMap)
+inesToMemMap :: (SliceU -> Source) -> INES -> ExceptT String IO (Mapper, Chunks, MemMap)
 inesToMemMap src ines = do
 	chunks <- mChunks
 	(prgA, prgB) <- case prgs ines of
 		[] -> throwError $ "There are no PRG ROMs in " ++ inesName ++ " to put in the memory map."
 		[prg] | BS.length prg == 0x4000 -> return (prg, prg)
 		prgA:prgB:_
-			|  BS.length prgA <= 0x4000
+			|  BS.length prgA == 0x4000
 			&& BS.length prgB == 0x4000 -> return (prgA, prgB)
 		_ -> throwError $ "The impossible happened! The PRG ROMs in " ++ inesName ++ " are not exactly 16KiB long."
 	return (mapper (header ines), chunks, buildMemMap prgA prgB)
@@ -66,7 +67,13 @@ inesToMemMap src ines = do
 		. traverse validateChunk
 		. M.fromListWith (++)
 		. map (\((bs, name), offset) -> (hash bs, [Chunk
-		  	{ source = src (Slice offset (fromIntegral (BS.length bs)))
+		  	{ source = id
+		  	         . src
+		  	         . maybe (singleton offset) id
+		  	         . fromStartSize offset
+		  	         . toInteger
+		  	         . BS.length
+		  	         $ bs
 		  	, content = bs
 		  	, description = name
 		  	}]))
@@ -109,25 +116,25 @@ inesToMemMap src ines = do
 	ppuMappings = zip [0x0000]
 		[chunkToMMI bs | bs <- chrs ines, BS.length bs == 0x2000]
 
-	chunkToMMI bs = Bytes bs (hash bs) (Slice 0 (fromIntegral (BS.length bs)))
+	chunkToMMI bs = Bytes bs (hash bs) (fromStartSizeBU 0 (toInteger (BS.length bs)))
 
 	ppuMirrors = case mirroring (header ines) of
-		Horizontal -> [(0x2400, Mirror (Slice 0x2000 0x0400)), (0x2c00, Mirror (Slice 0x2800 0x0400))]
-		Vertical   -> [(0x2800, Mirror (Slice 0x2000 0x0400)), (0x2c00, Mirror (Slice 0x2400 0x0400))]
+		Horizontal -> [(0x2400, Mirror (fromStartSizeB 0x2000 0x0400)), (0x2c00, Mirror (fromStartSizeB 0x2800 0x0400))]
+		Vertical   -> [(0x2800, Mirror (fromStartSizeB 0x2000 0x0400)), (0x2c00, Mirror (fromStartSizeB 0x2400 0x0400))]
 		FourScreen -> []
 
 	cpuMirrors =
-		[ (0x0800, Mirror (Slice 0x0000 0x0800))
-		, (0x1000, Mirror (Slice 0x0000 0x1000))
-		, (0x2008, Mirror (Slice 0x2000 0x0008))
-		, (0x2010, Mirror (Slice 0x2000 0x0010))
-		, (0x2020, Mirror (Slice 0x2000 0x0020))
-		, (0x2040, Mirror (Slice 0x2000 0x0040))
-		, (0x2080, Mirror (Slice 0x2000 0x0080))
-		, (0x2100, Mirror (Slice 0x2000 0x0100))
-		, (0x2200, Mirror (Slice 0x2000 0x0200))
-		, (0x2400, Mirror (Slice 0x2000 0x0400))
-		, (0x2800, Mirror (Slice 0x2000 0x0800))
+		[ (0x0800, Mirror (fromStartSizeB 0x0000 0x0800))
+		, (0x1000, Mirror (fromStartSizeB 0x0000 0x1000))
+		, (0x2008, Mirror (fromStartSizeB 0x2000 0x0008))
+		, (0x2010, Mirror (fromStartSizeB 0x2000 0x0010))
+		, (0x2020, Mirror (fromStartSizeB 0x2000 0x0020))
+		, (0x2040, Mirror (fromStartSizeB 0x2000 0x0040))
+		, (0x2080, Mirror (fromStartSizeB 0x2000 0x0080))
+		, (0x2100, Mirror (fromStartSizeB 0x2000 0x0100))
+		, (0x2200, Mirror (fromStartSizeB 0x2000 0x0200))
+		, (0x2400, Mirror (fromStartSizeB 0x2000 0x0400))
+		, (0x2800, Mirror (fromStartSizeB 0x2000 0x0800))
 		]
 
 	headerLen = 0x10
@@ -137,11 +144,11 @@ inesToMemMap src ines = do
 		   | otherwise      -> BS8.unpack bs ++ " (" ++ srcName ++ ")"
 
 ppSlice :: Source -> String
-ppSlice (File fp (Slice o s)) = show o ++ "-" ++ show (o+s)
+ppSlice (File _ slice) = show (start slice) ++ "-" ++ show (end slice)
 ppSlice (Zip _ s) = ppSlice s
 
-ppSource :: (Slice -> Source) -> String
-ppSource src = go (src (Slice 0 0)) where
+ppSource :: (SliceU -> Source) -> String
+ppSource src = go (src (singleton 0)) where
 	go (File fp _) = fp
 	go (Zip fp s) = fp ++ ":" ++ go s
 
